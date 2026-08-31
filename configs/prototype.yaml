@@ -1,0 +1,141 @@
+# prototype-v0.1 — validates the complete pipeline on a small, real slice
+# before scaling to the full corpus. Real data only.
+#
+# Gated sources (bigcode/*) activate automatically once `hf auth login` has
+# been run with the dataset terms accepted; the-stack-v2 additionally needs
+# AWS credentials for Software Heritage S3. Sources whose credentials are
+# missing are SKIPPED with an explanatory log line — gating is never bypassed.
+
+pipeline_version: "0.1.0"
+
+paths:
+  workspace: "./workspace"
+  keep_local_processed: false
+
+hf:
+  # CHANGE THIS to your namespace before running with mode: real.
+  target_repo: "CHANGE-ME/unified-real-world-code-prototype"
+  private: true
+  mode: real           # crash tests override to mock via UCC_HF_MODE
+  upload_excluded_reports: true
+  max_retries: 5
+
+queue:
+  max_local_shards: 5        # HARD spec cap: downloading+waiting+processing
+  download_workers: 3
+  process_workers: 1
+  max_retries: 4
+  retry_backoff_base_s: 30
+  retry_backoff_max_s: 3600
+  min_free_disk_gb: 20
+  status_interval_s: 30
+
+shard:                       # raw shard size in GB (1 GB = 10^9 bytes)
+  target_gb: 1.5
+  min_gb: 1.0
+  max_gb: 2.0
+
+processing:
+  batch_size: 2048
+  upload_per_batch: false      # prototype exercises shard-mode checkpoints;
+                               # the main config.yaml exercises per-batch mode
+  checkpoint_after: ["normalize", "dedup_near", "secrets_scan"]
+  parquet_compression: zstd
+  parquet_row_group_size: 2048
+  token_counter: heuristic   # tiktoken for exact counts (install extra)
+
+dedup:
+  exact: {enabled: true}
+  near:
+    enabled: true
+    mode: annotate           # full subset keeps annotated near-dups
+    num_perm: 128
+    bands: 16
+    jaccard_threshold: 0.75
+    shingle_size: 5
+    min_tokens: 30
+    exempt_record_types: [commit, issue]
+
+licenses:
+  permissive_action: keep
+  weak_copyleft_action: flag
+  strong_copyleft_action: drop
+  unknown_action: flag
+  source_level_permissive: [starcoderdata, starcoder2data_extras]
+
+secrets:
+  enabled: true
+  redact_emails: true
+  redact_ips: true
+  max_hits_per_file: 20
+  drop_env_like_files: true
+
+quality:
+  min_content_chars: 2
+  max_content_bytes: 1048576
+  minified_avg_line_len: 250.0
+  minified_max_line_len: 10000
+  max_base64_run: 2048
+  repeated_line_ratio: 0.10
+  min_alnum_ratio: 0.20
+  lockfile_max_bytes: 204800
+  drop_flags: [binary_like, empty, too_large, minified, vendored,
+               data_blob_heavy, repeated_content, generated_metadata,
+               lockfile_large, low_alnum]
+  flag_only: [generated_marker, lockfile, suspicious_obfuscation]
+
+complexity:
+  min_file_tokens: 4
+  drop_below_min_tokens: true
+
+subsets:
+  materialize_high_quality: true
+  high_quality_min_score: null
+
+prototype:
+  max_total_shards: 8        # global safety cap for the prototype run
+
+sources:
+  # PUBLIC — Dolma jsonl.gz shards (~1.5 GB each; languages <= ~Markdown).
+  common_pile_stackv2:
+    enabled: true
+    repo_id: common-pile/stackv2
+    file_patterns: ["documents/*_stackv2.jsonl.gz", "*_stackv2.jsonl.gz"]
+    max_shards: 2
+
+  # PUBLIC — edu-filtered Stack v2; carries Python/TS/etc. + quality scores.
+  common_pile_stackv2_edu:
+    enabled: true
+    repo_id: common-pile/stackv2_edu_filtered
+    file_patterns: ["stack-edu-*.json.gz", "*/stack-edu-*.json.gz"]
+    max_shards: 2
+
+  # PUBLIC — real GitHub issues ({repo_name, content, issue_id}).
+  starcoder2data_extras:
+    enabled: true
+    repo_id: bigcode/starcoder2data-extras
+    include_configs: [issues]
+    max_shards: 1
+
+  # GATED (accepted-terms HF token required).
+  starcoderdata:
+    enabled: true
+    repo_id: bigcode/starcoderdata
+    include_dirs: [python, sql, dockerfile, git-commits-cleaned,
+                   github-issues-filtered-structured]
+    max_shards: 2
+
+  # GATED + Software Heritage S3 (HF terms AND AWS credentials required).
+  the_stack_v2:
+    enabled: true
+    repo_id: bigcode/the-stack-v2
+    languages: [Python, SQL, Dockerfile]
+    shard_gb: null             # inherit shard.target_gb; set to override
+    est_file_size_kb: 12       # avg file-size estimate -> per-shard budget
+    max_files_per_language: 1
+    max_shards: 1
+    swh:
+      bucket: softwareheritage
+      prefix: content
+      max_fetch_threads: 16
+      max_missing_ratio: 0.05

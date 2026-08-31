@@ -1,0 +1,195 @@
+# =============================================================================
+# unified-code-corpus — MAIN CONFIG (default for every `ucc` command)
+#
+# Credentials & dataset name live in .env (HF_TOKEN, UCC_TARGET_REPO) — never
+# here. Precedence: shell env > .env > this file.
+#
+# Every knob below is safe to change between runs EXCEPT the ones marked
+# [DATA-AFFECTING]: those are part of the config hash, and changing them
+# mid-corpus makes `ucc run` stop and ask for --allow-config-change so you
+# never silently mix two differently-processed corpora. Operational knobs
+# (queue, paths, hf, retries, per-source max_shards) are hash-exempt.
+#
+# Presets: configs/prototype.yaml (small validation run), configs/full.yaml
+# (uncapped corpus). Use them via `ucc run -c configs/prototype.yaml`.
+# =============================================================================
+
+pipeline_version: "0.1.0"
+
+# ----------------------------------------------------------------- storage --
+paths:
+  workspace: "./workspace"      # raw/work/processed shards + manifest.db
+  keep_local_processed: false   # true = keep processed parquets after upload
+
+# ------------------------------------------------------------ hugging face --
+hf:
+  # Prefer setting UCC_TARGET_REPO in .env; that value overrides this one.
+  target_repo: "CHANGE-ME/unified-real-world-code"
+  private: true                 # keep the dataset private until you review it
+  mode: real                    # real | mock (mock = local dir, no network)
+  upload_excluded_reports: true # publish the excluded-records audit parquet
+  max_retries: 5                # network retries per hub call
+
+# -------------------------------------------------- queue & concurrency -----
+queue:
+  max_local_shards: 5           # HARD cap on raw shards on disk at once
+                                # (downloading + waiting + processing +
+                                #  awaiting verified upload)
+  download_workers: 3           # parallel shard downloads
+  process_workers: 1            # >1 possible; 1 keeps dedup order deterministic
+  max_retries: 4                # per-shard retry budget for failed states
+  retry_backoff_base_s: 30      # backoff = base * 2^attempt, capped below
+  retry_backoff_max_s: 3600
+  min_free_disk_gb: 20          # downloads pause below this free space
+  status_interval_s: 10         # OVERALL % line cadence (pipeline-wide)
+  progress_log_interval_s: 5    # per-task live % cadence (stage/download/
+                                # upload lines); lower = chattier logs
+
+# --------------------------------------------------------- shard sizing -----
+# [DATA-AFFECTING] Raw shard size, in GB (decimal: 1 GB = 10^9 bytes;
+# fractions allowed, e.g. 0.5). Increase for fewer/larger shards (better
+# throughput, more RAM per shard), decrease for smaller machines.
+# RAM guide: a shard is fully loaded during processing — budget roughly
+# 2-3x target_gb of free memory per process worker.
+shard:
+  target_gb: 1.5                # <- main size knob
+  min_gb:    1.0                # lower bound when grouping source files
+  max_gb:    2.0                # upper bound / split threshold
+
+# ------------------------------------------------------------ processing ----
+processing:                     # [DATA-AFFECTING] except batch_size and
+                                # checkpoint_after (hash-exempt: they change
+                                # chunking/resume granularity, never the data)
+  batch_size: 600000            # records per processing batch. With
+                                # upload_per_batch below, this is ALSO the
+                                # size of each uploaded parquet part.
+                                # Large = fewer/bigger HF commits, more RAM;
+                                # lower to 50000-100000 on small machines.
+  upload_per_batch: true        # true: jaise hi ek batch ki processing
+                                # complete hoti hai, wahi poora batch turant
+                                # HF pe upload + verify ho jata hai
+                                # (part-{shard}-b{batch}.parquet). Crash-
+                                # resume batch level pe hota hai. false:
+                                # upload only after the whole shard finishes.
+  checkpoint_after:             # SHARD-mode resume checkpoints (ignored when
+    - normalize                 # upload_per_batch is true — there the batch
+    - dedup_near                # itself is the checkpoint unit)
+    - secrets_scan
+  parquet_compression: zstd
+  parquet_row_group_size: 2048
+  token_counter: heuristic      # heuristic | tiktoken (pip install .[tokens])
+
+# ---------------------------------------------------------- deduplication ---
+dedup:                          # [DATA-AFFECTING]
+  exact: {enabled: true}        # SHA-256, global across all sources/shards
+  near:
+    enabled: true
+    mode: annotate              # annotate = keep near-dups in `full`, flagged
+                                #            (excluded from high_quality)
+                                # drop     = remove them entirely
+    num_perm: 128               # MinHash permutations (accuracy vs speed)
+    bands: 16                   # LSH bands; num_perm must divide evenly
+    jaccard_threshold: 0.75     # lower = more aggressive near-dedup
+    shingle_size: 5             # word-shingle width
+    min_tokens: 30              # shorter records: exact dedup only
+    exempt_record_types: [commit, issue]   # never dedup real history
+
+# -------------------------------------------------------------- licenses ----
+licenses:                       # [DATA-AFFECTING] actions: keep | flag | drop
+  permissive_action: keep
+  weak_copyleft_action: flag    # MPL/LGPL/EPL/CC-BY-SA...
+  strong_copyleft_action: drop  # GPL/AGPL/SSPL...
+  unknown_action: flag
+  source_level_permissive:      # sources already license-filtered upstream
+    - starcoderdata
+    - starcoder2data_extras
+
+# ---------------------------------------------------------------- secrets ---
+secrets:                        # [DATA-AFFECTING]
+  enabled: true
+  redact_emails: true
+  redact_ips: true              # public IPs only; private ranges stay
+  max_hits_per_file: 20         # more redactions than this -> drop the file
+  drop_env_like_files: true     # .env, id_rsa, *.pem, .netrc, credentials...
+
+# ---------------------------------------------------------------- quality ---
+quality:                        # [DATA-AFFECTING]
+  min_content_chars: 2
+  max_content_bytes: 1048576    # 1 MB per-file cap (keep-list files exempt)
+  minified_avg_line_len: 250.0
+  minified_max_line_len: 10000
+  max_base64_run: 2048
+  repeated_line_ratio: 0.10
+  min_alnum_ratio: 0.20
+  lockfile_max_bytes: 204800
+  # Flags in drop_flags remove the record (logged in excluded/); flag_only
+  # just annotates. Move names between the lists to tune strictness.
+  drop_flags: [binary_like, empty, too_large, minified, vendored,
+               data_blob_heavy, repeated_content, generated_metadata,
+               lockfile_large, low_alnum]
+  flag_only: [generated_marker, lockfile, suspicious_obfuscation]
+
+# ------------------------------------------------------------- complexity ---
+complexity:                     # [DATA-AFFECTING]
+  min_file_tokens: 4            # drop trivial code records below this
+  drop_below_min_tokens: true
+
+# ----------------------------------------------------------------- subsets --
+subsets:                        # [DATA-AFFECTING]
+  materialize_high_quality: true
+  high_quality_min_score: null  # e.g. 3 to require stackv2_edu int_score >= 3
+
+# -------------------------------------------------------------- run scale ---
+prototype:
+  max_total_shards: 8           # GLOBAL cap for safe first runs.
+                                # Set to null for the full corpus.
+
+# ----------------------------------------------------------------- sources --
+# enabled/max_shards are operational (hash-exempt): flip sources on/off and
+# raise caps freely. max_shards: null = no cap for that source.
+sources:
+  common_pile_stackv2:              # PUBLIC — Stack v2 slice, langs <= ~Markdown
+    enabled: true
+    repo_id: common-pile/stackv2
+    file_patterns: ["documents/*_stackv2.jsonl.gz", "*_stackv2.jsonl.gz"]
+    max_shards: 2
+
+  common_pile_stackv2_edu:          # PUBLIC — Python/TS/Go/... + quality score
+    enabled: true
+    repo_id: common-pile/stackv2_edu_filtered
+    file_patterns: ["stack-edu-*.json.gz", "*/stack-edu-*.json.gz"]
+    max_shards: 2
+
+  starcoder2data_extras:            # PUBLIC — real GitHub issues (+ docs)
+    enabled: true
+    repo_id: bigcode/starcoder2data-extras
+    include_configs: [issues]       # add: documentation
+    max_shards: 1
+
+  starcoderdata:                    # GATED — needs accepted terms + HF_TOKEN
+    enabled: true
+    repo_id: bigcode/starcoderdata
+    include_dirs: [python, sql, dockerfile,
+                   git-commits-cleaned, github-issues-filtered-structured]
+    # full-corpus example: add javascript, typescript, go, rust, java, yaml,
+    # shell, html, css, hcl, makefile, jupyter-scripts-dedup-filtered, ...
+    max_shards: 2
+
+  the_stack_v2:                     # GATED + AWS creds (Software Heritage S3)
+    enabled: true
+    repo_id: bigcode/the-stack-v2
+    languages: [Python, SQL, Dockerfile]
+    # Shard size in GB for this source. Omit (or null) to inherit
+    # shard.target_gb from above; override here if you want stack-v2 shards
+    # sized differently from the rest.
+    shard_gb: null
+    est_file_size_kb: 12            # advanced: avg source-file size estimate
+                                    # used to convert the GB target into a
+                                    # per-shard file budget
+    max_files_per_language: 1       # null = all files (full corpus)
+    max_shards: 1
+    swh:
+      bucket: softwareheritage
+      prefix: content
+      max_fetch_threads: 16         # parallel S3 blob fetches
+      max_missing_ratio: 0.05       # fail the shard above this missing rate
