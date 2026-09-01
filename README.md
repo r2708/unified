@@ -52,8 +52,9 @@ activate automatically once credentials exist.
 Downloads run **concurrently** with processing; the producer pauses
 automatically when 5 raw shards are local and resumes the moment a verified
 shard's raw data is deleted. Every step transitions a SQLite state machine
-(`workspace/manifest.db`, WAL + `synchronous=FULL`), so a crash at any
-instant — mid-download, mid-stage, mid-upload, mid-verify — resumes without
+(`workspace/manifest.db`, WAL + `synchronous=NORMAL` with an explicit WAL
+fsync barrier at every batch boundary), so a crash at any instant —
+mid-download, mid-stage, mid-upload, mid-verify — resumes without
 duplicating work.
 
 ### Per-batch upload mode (`processing.upload_per_batch: true` — on in config.yaml)
@@ -261,6 +262,41 @@ is_near_duplicate, near_dup_cluster, pipeline_version, config_hash`
 - **Known layout quirk:** the Common Pile gzip streams can end abruptly
   (transport closes before gzip EOF bookkeeping); the reader treats
   `EOFError/ValueError/OSError` at the tail as end-of-shard and logs it.
+
+## Performance notes
+
+- **`processing.cpu_workers`** (default `0` = auto: cpu_count−2, max 8) runs
+  the per-record CPU-bound work — MinHash signatures, the secrets battery,
+  quality metrics — on a process pool. Results are **bit-identical** to
+  serial (`cpu_workers: 1`); the knob is excluded from the config hash.
+  Budget some extra RAM per worker for content chunks in flight.
+- MinHash permutation arrays are built once per `num_perm` (they are
+  seed-deterministic, so signatures stay identical across runs, restarts and
+  the persisted LSH index), and cross-shard LSH candidate lookups are batched
+  per chunk of records instead of one query per record per band.
+- The 19-pattern secrets battery only runs on records that hit a combined
+  literal-anchor pre-scan (~3x on clean files); `tests/test_secrets.py`
+  asserts every battery pattern is covered by an anchor.
+- Per-repo aggregate reads/writes in the classify/complexity stages are
+  batched into single transactions instead of one commit per repository.
+- the-stack-v2 SWH downloads reuse one thread pool and prefetch the next
+  blob chunk while the current one is decoded and written
+  (`swh.max_fetch_threads` is hash-exempt — tune it freely).
+- JSONL parsing uses `orjson` when installed, with a per-line stdlib
+  fallback so accepted input is identical either way.
+- The manifest runs WAL + `synchronous=NORMAL`: commits skip per-transaction
+  fsyncs (a large I/O win on cloud disks) while staying corruption-proof;
+  `Manifest.sync()` issues one real fsync per uploaded batch, right before
+  the batch is marked done, so power loss can never mark work done whose
+  index commits were lost. App crashes (`kill -9`, OOM) lose nothing.
+- Output files upload and verify up to `hf.upload_workers` (default 4) in
+  parallel — safe because each file's upload is independent, idempotent
+  (present-and-matching remotes are skipped) and internally retried.
+- Parquet row groups close at `parquet_row_group_size` rows (default 65536)
+  **or** `parquet_row_group_max_mb` (default 64) of uncompressed content,
+  whichever first: big groups make downstream DuckDB/Spark/Polars scans much
+  faster, the byte cap bounds writer memory. Both are layout-only and
+  hash-exempt.
 
 ## Repo layout
 

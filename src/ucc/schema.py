@@ -147,24 +147,40 @@ def rows_to_table(rows: list[dict], schema: pa.Schema = UNIFIED_SCHEMA) -> pa.Ta
     return pa.Table.from_pylist(rows, schema=schema)
 
 
+DEFAULT_ROW_GROUP_ROWS = 65536
+DEFAULT_ROW_GROUP_BYTES = 64 * 1024 * 1024
+
+
 def write_rows_parquet(
     rows: Iterable[dict],
     path: str,
     schema: pa.Schema = UNIFIED_SCHEMA,
     compression: str = "zstd",
-    row_group_size: int = 2048,
+    row_group_size: int = DEFAULT_ROW_GROUP_ROWS,
+    row_group_max_bytes: int = DEFAULT_ROW_GROUP_BYTES,
 ) -> int:
-    """Stream rows to a parquet file in bounded batches. Returns row count."""
+    """Stream rows to a parquet file in bounded batches. Returns row count.
+
+    A row group closes at `row_group_size` rows OR `row_group_max_bytes` of
+    (uncompressed) content, whichever comes first: large row groups make
+    downstream scans (DuckDB/Spark/Polars) far faster on metadata-sized rows,
+    while the byte cap keeps writer memory bounded when records are big
+    (content may be up to quality.max_content_bytes each)."""
     writer = pq.ParquetWriter(path, schema, compression=compression)
     count = 0
     batch: list[dict] = []
+    batch_bytes = 0
     try:
         for row in rows:
             batch.append(row)
-            if len(batch) >= row_group_size:
+            batch_bytes += int(
+                row.get("size_bytes") or len(row.get("content") or "") or 256
+            )
+            if len(batch) >= row_group_size or batch_bytes >= row_group_max_bytes:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
                 count += len(batch)
                 batch = []
+                batch_bytes = 0
         if batch:
             writer.write_table(pa.Table.from_pylist(batch, schema=schema))
             count += len(batch)

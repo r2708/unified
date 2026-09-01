@@ -250,8 +250,10 @@ def _run_batched_mode(ctx: ShardContext) -> ShardContext:
         outputs = write_subset_outputs(ctx, rows, part_name)
 
         # The whole processed batch goes to the Hub right now.
-        upload_outputs(ctx.hub, outputs, f"{shard_id} batch {batch_idx}")
-        verify_outputs(ctx.hub, outputs)
+        upload_workers = int(ctx.cfg.path("hf.upload_workers", 4))
+        upload_outputs(ctx.hub, outputs, f"{shard_id} batch {batch_idx}",
+                       workers=upload_workers)
+        verify_outputs(ctx.hub, outputs, workers=upload_workers)
 
         done[key] = {
             "files": outputs,
@@ -259,6 +261,11 @@ def _run_batched_mode(ctx: ShardContext) -> ShardContext:
             "records_out": len(rows),
             "token_count": sum(r.get("token_count") or 0 for r in rows),
         }
+        # Durability barrier BEFORE the fsynced progress file marks this
+        # batch done: with synchronous=NORMAL a power cut may drop the newest
+        # manifest commits, and a batch recorded as done is never re-run — so
+        # its dedup-index rows must be on disk first. One fsync per batch.
+        ctx.manifest.sync()
         atomic_write_json(progress_path, {"batches": done})
         ctx.manifest.update_shard_stats(shard_id, ctx.stats)
         ctx.log.info(

@@ -304,7 +304,10 @@ class Orchestrator:
                 shard_id, [ShardState.PROCESSED, ShardState.UPLOADING],
                 ShardState.UPLOADING,
             )
-            transferred = upload_outputs(self.hub, outputs, shard_id)
+            transferred = upload_outputs(
+                self.hub, outputs, shard_id,
+                workers=int(self.cfg.path("hf.upload_workers", 4)),
+            )
             log.info("[%s] upload done (%d files transferred)", shard_id, transferred)
             maybe_crash("after_upload_before_verify")
             return self.manifest.transition(
@@ -326,7 +329,10 @@ class Orchestrator:
         shard_id = shard["shard_id"]
         try:
             outputs = load_processed_outputs(self.paths.processed / shard_id)
-            verify_outputs(self.hub, outputs)
+            verify_outputs(
+                self.hub, outputs,
+                workers=int(self.cfg.path("hf.upload_workers", 4)),
+            )
             ok = self.manifest.transition(
                 shard_id, [ShardState.UPLOADED], ShardState.VERIFIED, error=None
             )

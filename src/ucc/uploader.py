@@ -8,6 +8,7 @@ crashed-and-resumed upload never duplicates files or overwrites valid output.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ucc.hf_remote import HubClient, verify_remote_file
@@ -15,6 +16,26 @@ from ucc.io_utils import read_json
 from ucc.logging_utils import get_logger
 
 log = get_logger("uploader")
+
+
+def _run_parallel(fn, outputs: list[dict], workers: int):
+    """Yield (output, result_or_exception) as each finishes. Order follows
+    completion when parallel; input order when workers == 1."""
+    workers = max(1, min(int(workers), len(outputs)))
+    if workers == 1:
+        for out in outputs:
+            try:
+                yield out, fn(out)
+            except Exception as exc:  # noqa: BLE001 - reported by the caller
+                yield out, exc
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, out): out for out in outputs}
+        for fut in as_completed(futures):
+            try:
+                yield futures[fut], fut.result()
+            except Exception as exc:  # noqa: BLE001 - reported by the caller
+                yield futures[fut], exc
 
 
 class UploadFailure(Exception):
@@ -33,14 +54,18 @@ def load_processed_outputs(processed_dir: str | Path) -> list[dict]:
     return list(blob["files"])
 
 
-def upload_outputs(hub: HubClient, outputs: list[dict], shard_id: str) -> int:
-    """Upload every output file that isn't already present-and-matching.
-    Logs live per-shard upload percentages. Returns how many files were
-    actually transferred."""
-    transferred = 0
+def upload_outputs(
+    hub: HubClient, outputs: list[dict], shard_id: str, workers: int = 4
+) -> int:
+    """Upload every output file that isn't already present-and-matching, up
+    to `workers` files in parallel (each upload is independent + idempotent:
+    already-matching remotes are skipped, and the hub client retries
+    transient failures internally). Logs live per-shard upload percentages.
+    Returns how many files were actually transferred."""
     total_bytes = sum(o["size"] for o in outputs) or 1
-    done_bytes = 0
-    for idx, out in enumerate(outputs, 1):
+
+    def _upload_one(out: dict) -> bool:
+        """True when bytes were transferred, False when skipped as matching."""
         local = Path(out["local"])
         if not local.exists():
             raise UploadFailure(f"local processed file missing: {local}")
@@ -49,44 +74,66 @@ def upload_outputs(hub: HubClient, outputs: list[dict], shard_id: str) -> int:
             expected_sha256=out.get("sha256"), expected_size=out.get("size"),
         )
         if ok:
-            done_bytes += out["size"]
+            out["_skip_reason"] = why
+            return False
+        log.info("uploading %s (%.1f MB) ...", out["dest"], out["size"] / 1e6)
+        hub.upload_file(local, out["dest"], message=f"ucc: shard {shard_id}")
+        return True
+
+    transferred = 0
+    done_bytes = 0
+    done_files = 0
+    first_error: Exception | None = None
+    for out, result in _run_parallel(_upload_one, outputs, workers):
+        if isinstance(result, Exception):
+            first_error = first_error or result
+            log.error("upload failed for %s: %s", out["dest"], result)
+            continue
+        done_files += 1
+        done_bytes += out["size"]
+        if result:
+            transferred += 1
+            log.info(
+                "uploaded %s — shard upload %5.1f%% (%.1f/%.1f MB, file %d/%d)",
+                out["dest"], 100.0 * done_bytes / total_bytes,
+                done_bytes / 1e6, total_bytes / 1e6, done_files, len(outputs),
+            )
+        else:
             log.info(
                 "skip upload (already on hub, %s): %s — shard upload %5.1f%% "
                 "(file %d/%d)",
-                why, out["dest"], 100.0 * done_bytes / total_bytes, idx, len(outputs),
+                out.pop("_skip_reason", ""), out["dest"],
+                100.0 * done_bytes / total_bytes, done_files, len(outputs),
             )
-            continue
-        log.info(
-            "uploading %s (%.1f MB) [file %d/%d] ...",
-            out["dest"], out["size"] / 1e6, idx, len(outputs),
-        )
-        hub.upload_file(local, out["dest"], message=f"ucc: shard {shard_id}")
-        transferred += 1
-        done_bytes += out["size"]
-        log.info(
-            "uploaded %s — shard upload %5.1f%% (%.1f/%.1f MB, file %d/%d)",
-            out["dest"], 100.0 * done_bytes / total_bytes,
-            done_bytes / 1e6, total_bytes / 1e6, idx, len(outputs),
-        )
+    if first_error is not None:
+        raise first_error
     return transferred
 
 
-def verify_outputs(hub: HubClient, outputs: list[dict]) -> None:
+def verify_outputs(hub: HubClient, outputs: list[dict], workers: int = 4) -> None:
     """Verify EVERY output file on the Hub against its recorded checksum and
-    size. Raises VerificationFailure listing what failed."""
-    failures: list[str] = []
-    for out in outputs:
+    size (read-only metadata calls, up to `workers` in parallel). Raises
+    VerificationFailure listing what failed."""
+
+    def _verify_one(out: dict) -> tuple[bool, str]:
         local = Path(out["local"])
-        ok, why = verify_remote_file(
+        return verify_remote_file(
             hub, local if local.exists() else None, out["dest"],
             expected_sha256=out.get("sha256"), expected_size=out.get("size"),
         )
+
+    failures: list[str] = []
+    for out, result in _run_parallel(_verify_one, outputs, workers):
+        if isinstance(result, Exception):
+            failures.append(f"{out['dest']}: {result}")
+            continue
+        ok, why = result
         if not ok:
             failures.append(f"{out['dest']}: {why}")
         else:
             log.info("verified %s (%s)", out["dest"], why)
     if failures:
-        raise VerificationFailure("; ".join(failures))
+        raise VerificationFailure("; ".join(sorted(failures)))
 
 
 def verify_outputs_remote_only(hub: HubClient, outputs: list[dict]) -> bool:

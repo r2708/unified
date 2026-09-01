@@ -12,14 +12,23 @@ through secret scanning and binary checks.
 
 Which flags drop vs. merely annotate is fully config-driven
 (quality.drop_flags / quality.flag_only).
+
+Performance shape: all content-derived signals for a record are computed in
+one pure function (`_content_signals`) — one splitlines, one C-level regex
+pass for the alnum ratio (bit-identical to the old per-character loop: \\w
+matches exactly str.isalnum() plus underscore), one slice per bounded head —
+optionally on the processing.cpu_workers process pool. Flag decisions,
+drops and stats stay in the parent, so results are identical to serial.
 """
 
 from __future__ import annotations
 
 import posixpath
 import re
+from functools import partial
 
 from ucc.constants import RT_CODE
+from ucc.parallel import parallel_map, resolve_cpu_workers
 from ucc.processing.base import ShardContext, Stage
 
 _VENDOR_PATH_RX = re.compile(
@@ -60,8 +69,23 @@ _OBFUSCATION_RX = re.compile(
     r"(eval|exec|Function)\s*\(\s*(atob|base64|b64decode|fromCharCode|chr)", re.IGNORECASE
 )
 
+# Everything str.isalnum() counts (\w == isalnum + underscore) plus the
+# code-punctuation set below — one C-level pass instead of a per-character
+# Python loop over up to 200 KB per record.
+_NON_ALNUM_RX = re.compile(r"[^\w(){}\[\];:=<>+\-*/.,'\"# \n\t]")
+
 # Flags length-exempted for keep-listed files.
 _LENGTH_FLAGS = {"minified", "low_alnum", "repeated_content", "too_large", "data_blob_heavy"}
+
+_BLOB_RX_CACHE: dict[int, re.Pattern] = {}
+
+
+def _blob_rx(base64_run: int) -> re.Pattern:
+    rx = _BLOB_RX_CACHE.get(base64_run)
+    if rx is None:
+        rx = re.compile(_BASE64_RUN_TEMPLATE % base64_run)
+        _BLOB_RX_CACHE[base64_run] = rx
+    return rx
 
 
 def _is_kept_engineering_file(path: str | None) -> bool:
@@ -71,18 +95,55 @@ def _is_kept_engineering_file(path: str | None) -> bool:
     return bool(_KEEP_BASENAME_RX.match(base) or _KEEP_PATH_RX.search(path))
 
 
-def compute_metrics(rec: dict) -> None:
-    content: str = rec["content"]
+def _content_signals(item: tuple[str, bool], base64_run: int) -> tuple:
+    """Pure per-record signal extraction (process-pool worker).
+
+    item = (content, is_code). Returns only scalars:
+    (line_count, max_line_length, total_line_length, alnum_count, sample_len,
+     stripped_len, has_nul, replacement_char_count, generated_marker,
+     obfuscation, blob_chars, unique_line_count)
+    """
+    content, is_code = item
     lines = content.splitlines() or [""]
     line_count = len(lines)
-    max_len = max((len(l) for l in lines), default=0)
-    avg_len = (sum(len(l) for l in lines) / line_count) if line_count else 0.0
+    lens = list(map(len, lines))
+    max_len = max(lens)
+    total_len = sum(lens)
+
     sample = content[:200_000]
-    alnum = sum(ch.isalnum() or ch in "_(){}[];:=<>+-*/.,'\"# \n\t" for ch in sample)
+    alnum = len(sample) - len(_NON_ALNUM_RX.findall(sample))
+
+    head = content[:100_000]
+    has_nul = "\x00" in head
+    repl_count = head.count("�")
+    stripped_len = len(content.strip())
+
+    gen_marker = False
+    obfuscation = False
+    blob_chars = 0
+    unique_lines = 0
+    if is_code:
+        gen_marker = _GENERATED_MARKER_RX.search(content[:2000]) is not None
+        obfuscation = _OBFUSCATION_RX.search(head) is not None
+        blob_chars = sum(
+            m.end() - m.start() for m in _blob_rx(base64_run).finditer(content)
+        )
+        if line_count > 200:
+            unique_lines = len(set(lines))
+
+    return (line_count, max_len, total_len, alnum, len(sample), stripped_len,
+            has_nul, repl_count, gen_marker, obfuscation, blob_chars, unique_lines)
+
+
+def compute_metrics(rec: dict) -> None:
+    """Stamp line/character metrics onto a record (shared helper)."""
+    line_count, max_len, total_len, alnum, sample_len, *_ = _content_signals(
+        (rec["content"], False), 0
+    )
     rec["line_count"] = line_count
     rec["max_line_length"] = max_len
-    rec["avg_line_length"] = round(avg_len, 2)
-    rec["alnum_ratio"] = round(alnum / max(len(sample), 1), 4)
+    rec["avg_line_length"] = round(total_len / line_count, 2)
+    rec["alnum_ratio"] = round(alnum / max(sample_len, 1), 4)
 
 
 class QualityFilterStage(Stage):
@@ -99,13 +160,26 @@ class QualityFilterStage(Stage):
         repeated_ratio = float(qcfg.get("repeated_line_ratio", 0.10))
         min_alnum = float(qcfg.get("min_alnum_ratio", 0.20))
         lockfile_max = int(qcfg.get("lockfile_max_bytes", 204_800))
-        blob_rx = re.compile(_BASE64_RUN_TEMPLATE % base64_run)
+        cpu_workers = resolve_cpu_workers(ctx.cfg.path("processing.cpu_workers", 1))
+
+        signals = parallel_map(
+            partial(_content_signals, base64_run=base64_run),
+            [(rec["content"], rec["record_type"] == RT_CODE) for rec in rows],
+            cpu_workers,
+        )
 
         out: list[dict] = []
         live = ctx.progress("quality_filter", total=len(rows))
-        for rec in rows:
+        for rec, sig in zip(rows, signals):
             live.update()
-            compute_metrics(rec)
+            (line_count, max_len, total_len, alnum, sample_len, stripped_len,
+             has_nul, repl_count, gen_marker, obfuscation, blob_chars,
+             unique_lines) = sig
+            rec["line_count"] = line_count
+            rec["max_line_length"] = max_len
+            rec["avg_line_length"] = round(total_len / line_count, 2)
+            rec["alnum_ratio"] = round(alnum / max(sample_len, 1), 4)
+
             content: str = rec["content"]
             path = rec.get("path") or ""
             base = posixpath.basename(path).lower() if path else ""
@@ -113,11 +187,11 @@ class QualityFilterStage(Stage):
             kept_file = _is_kept_engineering_file(path)
             is_code = rec["record_type"] == RT_CODE
 
-            if "\x00" in content[:100_000] or (
-                len(content) > 0 and content[:100_000].count("�") / min(len(content), 100_000) > 0.02
+            if has_nul or (
+                len(content) > 0 and repl_count / min(len(content), 100_000) > 0.02
             ):
                 flags.add("binary_like")
-            if len(content.strip()) < min_chars:
+            if stripped_len < min_chars:
                 flags.add("empty")
             if rec["size_bytes"] > max_bytes:
                 flags.add("too_large")
@@ -134,11 +208,11 @@ class QualityFilterStage(Stage):
                     flags.add("vendored")
                 if path and _GENERATED_PATH_RX.search(path):
                     flags.add("generated_metadata")
-                if _GENERATED_MARKER_RX.search(content[:2000]):
+                if gen_marker:
                     flags.add("generated_marker")
                 if rec["alnum_ratio"] < min_alnum:
                     flags.add("low_alnum")
-                if _OBFUSCATION_RX.search(content[:100_000]):
+                if obfuscation:
                     flags.add("suspicious_obfuscation")
 
                 if base in _LOCKFILE_BASENAMES:
@@ -146,15 +220,13 @@ class QualityFilterStage(Stage):
                     if rec["size_bytes"] > lockfile_max:
                         flags.add("lockfile_large")
 
-                blob_chars = sum(len(m) for m in blob_rx.findall(content))
                 if blob_chars:
                     flags.add("data_blob")
                     if blob_chars / max(len(content), 1) > 0.5:
                         flags.add("data_blob_heavy")
 
-                if rec["line_count"] > 200:
-                    unique_ratio = len(set(content.splitlines())) / rec["line_count"]
-                    if unique_ratio < repeated_ratio:
+                if line_count > 200:
+                    if unique_lines / line_count < repeated_ratio:
                         flags.add("repeated_content")
 
             for flag in flags:

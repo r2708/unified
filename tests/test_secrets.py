@@ -77,3 +77,51 @@ def test_secret_dense_file_dropped(make_ctx):
     out = run_stage([rec], ctx)
     assert out == []
     assert any(e["reason"] == "secret_dense" for e in ctx.excluded)
+
+
+# One synthetic (obviously fake) example per battery pattern, used to prove
+# the anchor prefilter can never skip a record the battery would redact.
+_PATTERN_EXAMPLES = {
+    "private_key_block": "-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----",
+    "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+    "github_token": "ghp_" + "a1" * 18,
+    "github_pat": "github_pat_" + "A" * 22,
+    "gitlab_pat": "glpat-" + "x" * 20,
+    "hf_token": "hf_" + "Q" * 30,
+    "slack_token": "xoxb-1234567890",
+    "google_api_key": "AIza" + "B" * 35,
+    "stripe_key": "sk_live_" + "c" * 24,
+    "sendgrid_key": "SG." + "d" * 22 + "." + "e" * 43,
+    "twilio_key": "SK" + "0f" * 16,
+    "npm_token": "npm_" + "g" * 36,
+    "pypi_token": "pypi-AgEIcHlwaS5vcmc" + "h" * 24,
+    "openai_key": "sk-" + "i" * 40,
+    "anthropic_key": "sk-ant-" + "j" * 24,
+    "azure_account_key": "AccountKey=" + "K" * 64,
+    "jwt": "eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
+    "url_credentials": "postgres://appuser:hunter2pass@db.internal/app",
+}
+
+
+def test_anchor_prefilter_covers_every_battery_pattern():
+    """The battery only runs when _ANCHOR_RX hits, so every pattern must be
+    covered by an anchor — this guards future additions to the battery."""
+    from ucc.processing.secrets_scan import _ANCHOR_RX, _SECRET_PATTERNS
+
+    assert set(_PATTERN_EXAMPLES) == {name for name, _ in _SECRET_PATTERNS}
+    for name, pattern in _SECRET_PATTERNS:
+        sample = f"some code before {_PATTERN_EXAMPLES[name]} and after"
+        assert pattern.search(sample), f"example for {name} must match its pattern"
+        assert _ANCHOR_RX.search(sample), f"anchor regex does not cover {name}"
+
+
+def test_anchor_skip_still_redacts_pii(make_ctx):
+    """A record with no battery anchors takes the fast path but email/IP
+    redaction must still run."""
+    ctx = make_ctx()
+    rec = make_rec("# contact ops@example-corp.net if 203.51.44.99 is down\n",
+                   path="notes.py")
+    out = run_stage([rec], ctx)
+    content = out[0]["content"]
+    assert "<EMAIL>" in content and "<IP_ADDRESS>" in content
+    assert out[0]["secrets_redacted"] == 0 and out[0]["pii_redacted"] == 2

@@ -22,12 +22,9 @@ import posixpath
 import re
 
 from ucc import constants as C
+from ucc.parallel import parallel_map, resolve_cpu_workers
 from ucc.processing.base import ShardContext, Stage
-from ucc.processing.classify import (
-    detect_technologies,
-    file_layer,
-    infer_language,
-)
+from ucc.processing.classify import infer_language, layer_and_technologies
 
 _DEP_PATTERNS = {
     "package.json": re.compile(r'"[^"\n]+"\s*:\s*"[~^><=0-9]'),
@@ -69,17 +66,37 @@ class RepoReconstructStage(Stage):
         stems_by_repo: dict[str, set[str]] = {}
         rows_by_repo: dict[str, list[dict]] = {}
 
-        for rec in rows:
-            repo = rec.get("repo_name")
-            if not repo:
-                ctx.bump("repo.records_without_repo")
-                continue
+        # The per-record layer/technology classification (a ~30-regex scan of
+        # each record's head) is pure, so it runs on the cpu_workers pool;
+        # language inference is path-only and stays inline.
+        cpu_workers = resolve_cpu_workers(ctx.cfg.path("processing.cpu_workers", 1))
+        repo_rows = [rec for rec in rows if rec.get("repo_name")]
+        if len(repo_rows) < len(rows):
+            ctx.bump("repo.records_without_repo", len(rows) - len(repo_rows))
+        languages = [
+            infer_language(rec.get("path"), rec.get("language")) for rec in repo_rows
+        ]
+        classified = parallel_map(
+            layer_and_technologies,
+            [
+                (rec.get("path"), language, (rec.get("content") or "")[:4000])
+                for rec, language in zip(repo_rows, languages)
+            ],
+            cpu_workers,
+        )
+
+        for rec, language, (layer, techs) in zip(repo_rows, languages, classified):
+            repo = rec["repo_name"]
             rows_by_repo.setdefault(repo, []).append(rec)
 
-            language = infer_language(rec.get("path"), rec.get("language"))
-            head = (rec.get("content") or "")[:4000]
-            layer = file_layer(rec.get("path"), language, head)
-            techs = detect_technologies(rec.get("path"), head)
+            # Cache for the classify stage so the ~30-regex tech/layer pass is
+            # not repeated per record. Underscore keys are dropped by the
+            # parquet schema at checkpoints (classify recomputes when absent),
+            # and classify ignores head-derived caches if the secrets stage
+            # redacted the content in between.
+            rec["_ucc_language"] = language
+            rec["_ucc_layer"] = layer
+            rec["_ucc_technologies"] = techs
 
             delta = deltas.setdefault(
                 repo,
@@ -87,7 +104,7 @@ class RepoReconstructStage(Stage):
                     "repo_url": rec.get("repo_url"),
                     "n_files": 0, "n_tokens": 0, "n_commits": 0, "n_issues": 0,
                     "n_deps": 0, "languages": {}, "layers": {},
-                    "technologies": [], "licenses": [],
+                    "technologies": set(), "licenses": set(),
                     "has_tests": False, "has_ci": False, "has_infrastructure": False,
                 },
             )
@@ -101,10 +118,8 @@ class RepoReconstructStage(Stage):
             if language:
                 delta["languages"][language] = delta["languages"].get(language, 0) + 1
             delta["layers"][layer] = delta["layers"].get(layer, 0) + 1
-            delta["technologies"] = sorted(set(delta["technologies"]) | set(techs))
-            delta["licenses"] = sorted(
-                set(delta["licenses"]) | {str(x) for x in rec.get("detected_licenses") or []}
-            )
+            delta["technologies"].update(techs)
+            delta["licenses"].update(str(x) for x in rec.get("detected_licenses") or [])
             if layer == C.LAYER_TESTING:
                 delta["has_tests"] = True
             if "ci_cd" in techs:
@@ -140,6 +155,12 @@ class RepoReconstructStage(Stage):
                     linked += 1
             interconnect[repo] = round(linked / len(repo_rows), 4)
         ctx.scratch["repo_interconnect"] = interconnect
+
+        # Set-accumulated fields -> deterministic sorted lists, once per repo
+        # (not re-sorted per record).
+        for delta in deltas.values():
+            delta["technologies"] = sorted(delta["technologies"])
+            delta["licenses"] = sorted(delta["licenses"])
 
         # Exactly-once key is batch-scoped in per-batch mode so every batch's
         # deltas merge once and a crashed batch re-run stays a no-op.

@@ -29,6 +29,7 @@ hf:
   mode: real                    # real | mock (mock = local dir, no network)
   upload_excluded_reports: true # publish the excluded-records audit parquet
   max_retries: 5                # network retries per hub call
+  upload_workers: 4             # parallel per-file uploads/verifications
 
 # -------------------------------------------------- queue & concurrency -----
 queue:
@@ -60,7 +61,7 @@ shard:
 processing:                     # [DATA-AFFECTING] except batch_size and
                                 # checkpoint_after (hash-exempt: they change
                                 # chunking/resume granularity, never the data)
-  batch_size: 600000            # records per processing batch. With
+  batch_size: 500000            # records per processing batch. With
                                 # upload_per_batch below, this is ALSO the
                                 # size of each uploaded parquet part.
                                 # Large = fewer/bigger HF commits, more RAM;
@@ -76,8 +77,19 @@ processing:                     # [DATA-AFFECTING] except batch_size and
     - dedup_near                # itself is the checkpoint unit)
     - secrets_scan
   parquet_compression: zstd
-  parquet_row_group_size: 2048
+  parquet_row_group_size: 65536 # rows per row group; a group also closes
+  parquet_row_group_max_mb: 64  # at this much uncompressed content, so
+                                # writer RAM stays bounded. Large groups =
+                                # much faster DuckDB/Spark/Polars scans.
+                                # Layout-only (hash-exempt).
   token_counter: heuristic      # heuristic | tiktoken (pip install .[tokens])
+  cpu_workers: 0                # process pool for per-record CPU work
+                                # (MinHash sigs, secrets scan, quality
+                                # metrics). 1 = serial, N = N workers,
+                                # 0 = auto (cpu_count-2, max 8). Results are
+                                # bit-identical to serial; hash-exempt.
+                                # RAM: each worker transiently holds content
+                                # chunks in flight.
 
 # ---------------------------------------------------------- deduplication ---
 dedup:                          # [DATA-AFFECTING]
@@ -191,5 +203,6 @@ sources:
     swh:
       bucket: softwareheritage
       prefix: content
-      max_fetch_threads: 16         # parallel S3 blob fetches
+      max_fetch_threads: 32         # parallel S3 blob fetches (small objects
+                                    # scale well to 32-64; hash-exempt)
       max_missing_ratio: 0.05       # fail the shard above this missing rate

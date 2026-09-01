@@ -41,8 +41,9 @@ processing:
                                # the main config.yaml exercises per-batch mode
   checkpoint_after: ["normalize", "dedup_near", "secrets_scan"]
   parquet_compression: zstd
-  parquet_row_group_size: 2048
+  parquet_row_group_size: 65536   # + parquet_row_group_max_mb: 64 byte cap
   token_counter: heuristic   # tiktoken for exact counts (install extra)
+  cpu_workers: 0             # 0 = auto; per-record CPU work process pool
 
 dedup:
   exact: {enabled: true}
@@ -137,5 +138,5 @@ sources:
     swh:
       bucket: softwareheritage
       prefix: content
-      max_fetch_threads: 16
+      max_fetch_threads: 32
       max_missing_ratio: 0.05

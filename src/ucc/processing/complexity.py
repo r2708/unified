@@ -64,7 +64,6 @@ class ComplexityStage(Stage):
         interconnect: dict[str, float] = ctx.scratch.get("repo_interconnect") or {}
 
         out: list[dict] = []
-        repo_scores: dict[str, float] = {}
         for rec in rows:
             if (
                 drop_trivial
@@ -74,17 +73,23 @@ class ComplexityStage(Stage):
                 ctx.exclude(rec, "trivial", detail=f"{rec['token_count']} tokens")
                 continue
             rec["file_complexity"] = file_complexity(rec.get("content") or "")
+            out.append(rec)
 
+        # Repo scores: one batched aggregate read + one batched write instead
+        # of two statements (and one fsync) per distinct repo.
+        repos = sorted({rec["repo_name"] for rec in out if rec.get("repo_name")})
+        aggs = ctx.manifest.get_repos(repos)
+        repo_scores = {
+            repo: repo_complexity_score(aggs.get(repo) or {}, interconnect.get(repo, 0.0))
+            for repo in repos
+        }
+        ctx.manifest.update_repo_computed_many(
+            [(repo, repo_scores[repo], None) for repo in repos]
+        )
+        for rec in out:
             repo = rec.get("repo_name")
             if repo:
-                if repo not in repo_scores:
-                    agg = ctx.manifest.get_repo(repo) or {}
-                    repo_scores[repo] = repo_complexity_score(
-                        agg, interconnect.get(repo, 0.0)
-                    )
-                    ctx.manifest.update_repo_computed(repo, complexity=repo_scores[repo])
                 rec["repo_complexity"] = repo_scores[repo]
-            out.append(rec)
 
         ctx.bump("complexity.records_out", len(out))
         return out

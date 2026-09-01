@@ -30,6 +30,21 @@ from ucc.logging_utils import get_logger
 
 log = get_logger("sources.readers")
 
+try:
+    import orjson as _orjson
+
+    def _json_loads(line: str):
+        # orjson is several times faster on the per-line hot path, but is
+        # stricter than the stdlib (bare NaN/Infinity, >64-bit ints). Fall
+        # back to the stdlib for exactly those lines so accepted input is
+        # byte-for-byte identical with and without orjson installed.
+        try:
+            return _orjson.loads(line)
+        except json.JSONDecodeError:
+            return json.loads(line)
+except ImportError:  # pragma: no cover - optional dependency
+    _json_loads = json.loads
+
 
 def iter_parquet_batches(
     path: Path, batch_size: int, skip: list[int] | None = None
@@ -87,7 +102,7 @@ def iter_jsonl_gz_batches(
                 if not line:
                     continue
                 try:
-                    batch.append(json.loads(line))
+                    batch.append(_json_loads(line))
                 except json.JSONDecodeError:
                     log.warning("undecodable JSON line in %s (skipped)", path.name)
                     continue
@@ -118,7 +133,7 @@ def iter_jsonl_batches(
             if not line:
                 continue
             try:
-                batch.append(json.loads(line))
+                batch.append(_json_loads(line))
             except json.JSONDecodeError:
                 continue
             if len(batch) >= batch_size:

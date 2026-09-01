@@ -5,6 +5,14 @@ passwords, high-entropy assignments) and obvious PII (emails, public IPs)
 in place; drops credential-carrier files (.env, id_rsa, *.pem, ...) and
 files saturated with secrets. Only aggregate counts are ever logged or kept
 in stats — never the matched values.
+
+Performance shape: every pattern in the battery starts with a distinctive
+literal, so a single combined anchor regex pre-screens each record and the
+19-pattern battery only runs on records that could possibly match (~3x on
+clean files, which are the overwhelming majority). The per-record scan is a
+pure function of the content, so it can run on the processing.cpu_workers
+process pool; all record mutation, drop decisions and stats stay in the
+parent and results are identical to a serial run.
 """
 
 from __future__ import annotations
@@ -12,8 +20,10 @@ from __future__ import annotations
 import math
 import posixpath
 import re
+from functools import partial
 
-from ucc.hashing import sha256_text
+from ucc.hashing import sha256_bytes
+from ucc.parallel import parallel_map, resolve_cpu_workers
 from ucc.processing.base import ShardContext, Stage
 from ucc.tokens import count_tokens
 
@@ -40,6 +50,19 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("url_credentials", re.compile(
         r"\b(?P<scheme>[a-z][a-z0-9+.\-]*)://(?P<user>[^/\s:@'\"]{1,64}):(?P<pw>[^/\s@'\"]{1,128})@")),
 ]
+
+# One literal anchor per battery pattern: any string the battery can match is
+# guaranteed to contain a match of this regex, so a single cheap scan skips
+# the whole battery on clean files. Keep in sync with _SECRET_PATTERNS —
+# tests/test_secrets.py asserts the coverage for every pattern.
+_ANCHOR_RX = re.compile(
+    r"-----BEGIN"
+    r"|AKIA|ASIA|ABIA|ACCA"
+    r"|gh[opusr]_|github_pat_|glpat-"
+    r"|hf_|xox[baprs]-|AIza|k_live_|SG\.|SK[0-9a-fA-F]"
+    r"|npm_|pypi-AgEI|sk-|AccountKey=|eyJ"
+    r"|://[^/\s@]+@"
+)
 
 _ASSIGNED_SECRET_RX = re.compile(
     r"""(?ix)\b(secret|token|passwd|password|api[_\-]?key|apikey|auth[_\-]?key|
@@ -90,6 +113,63 @@ def _is_nonroutable_or_versionlike(octets: tuple[str, ...]) -> bool:
     return False
 
 
+def _url_repl(m: re.Match) -> str:
+    return f"{m.group('scheme')}://{m.group('user')}:<REDACTED_PASSWORD>@"
+
+
+def _scan_content(
+    content: str, redact_emails: bool, redact_ips: bool
+) -> tuple[str | None, list[tuple[str, int]], int, int, int]:
+    """Pure per-record scan (process-pool worker).
+
+    Returns (redacted content — or None when nothing was hit, per-battery-type
+    counts, high-entropy-assignment hits, email hits, ip hits). Never touches
+    shared state; only counts and the (possibly) redacted text travel back.
+    """
+    type_counts: list[tuple[str, int]] = []
+    if _ANCHOR_RX.search(content) is not None:
+        for name, pattern in _SECRET_PATTERNS:
+            if name == "url_credentials":
+                content, n = pattern.subn(_url_repl, content)
+            else:
+                content, n = pattern.subn(f"<REDACTED_{name.upper()}>", content)
+            if n:
+                type_counts.append((name, n))
+
+    assign_hits = 0
+
+    def _assign_repl(m: re.Match) -> str:
+        nonlocal assign_hits
+        value = m.group(2)
+        if _shannon_entropy(value) >= 4.0:
+            assign_hits += 1
+            return m.group(0).replace(value, "<REDACTED_SECRET>")
+        return m.group(0)
+
+    content = _ASSIGNED_SECRET_RX.sub(_assign_repl, content)
+
+    email_hits = 0
+    if redact_emails:
+        content, email_hits = _EMAIL_RX.subn("<EMAIL>", content)
+
+    ip_hits = 0
+    if redact_ips:
+        ip_cell = [0]
+
+        def _ip_repl(m: re.Match) -> str:
+            if _is_nonroutable_or_versionlike(m.groups()):
+                return m.group(0)
+            ip_cell[0] += 1
+            return "<IP_ADDRESS>"
+
+        content = _IPV4_RX.sub(_ip_repl, content)
+        ip_hits = ip_cell[0]
+
+    hit_anything = bool(type_counts or assign_hits or email_hits or ip_hits)
+    return (content if hit_anything else None, type_counts, assign_hits,
+            email_hits, ip_hits)
+
+
 class SecretsScanStage(Stage):
     name = "secrets_scan"
 
@@ -102,11 +182,11 @@ class SecretsScanStage(Stage):
         redact_ips = bool(scfg.get("redact_ips", True))
         drop_env_like = bool(scfg.get("drop_env_like_files", True))
         token_mode = ctx.cfg.processing.token_counter
+        cpu_workers = resolve_cpu_workers(ctx.cfg.path("processing.cpu_workers", 1))
 
-        out: list[dict] = []
-        live = ctx.progress("secrets_scan", total=len(rows))
+        # Pass 1 — carrier-file drops (path-only, cheap, stays in the parent).
+        survivors: list[dict] = []
         for rec in rows:
-            live.update()
             path = rec.get("path") or ""
             base = posixpath.basename(path)
             if (
@@ -117,60 +197,45 @@ class SecretsScanStage(Stage):
             ):
                 ctx.exclude(rec, "secret_carrier_file", detail=base)
                 continue
+            survivors.append(rec)
 
-            content = rec["content"]
-            secret_hits = 0
-            for name, pattern in _SECRET_PATTERNS:
-                if name == "url_credentials":
-                    def _url_repl(m: re.Match) -> str:
-                        return f"{m.group('scheme')}://{m.group('user')}:<REDACTED_PASSWORD>@"
+        # Pass 2 — the content scans (pure per-record work, parallelizable).
+        scan_fn = partial(
+            _scan_content, redact_emails=redact_emails, redact_ips=redact_ips
+        )
+        results = parallel_map(
+            scan_fn, [rec["content"] for rec in survivors], cpu_workers
+        )
 
-                    content, n = pattern.subn(_url_repl, content)
-                else:
-                    content, n = pattern.subn(f"<REDACTED_{name.upper()}>", content)
-                if n:
-                    secret_hits += n
-                    ctx.bump(f"secrets.type.{name}", n)
-
-            def _assign_repl(m: re.Match) -> str:
-                value = m.group(2)
-                if _shannon_entropy(value) >= 4.0:
-                    return m.group(0).replace(value, "<REDACTED_SECRET>")
-                return m.group(0)
-
-            new_content = _ASSIGNED_SECRET_RX.sub(_assign_repl, content)
-            n_assign_real = new_content.count("<REDACTED_SECRET>") - content.count(
-                "<REDACTED_SECRET>"
-            )
-            if n_assign_real > 0:
-                secret_hits += n_assign_real
-                ctx.bump("secrets.type.high_entropy_assignment", n_assign_real)
-            content = new_content
-
-            pii_hits = 0
-            if redact_emails:
-                content, n = _EMAIL_RX.subn("<EMAIL>", content)
-                pii_hits += n
-            if redact_ips:
-                def _ip_repl(m: re.Match) -> str:
-                    nonlocal pii_hits
-                    if _is_nonroutable_or_versionlike(m.groups()):
-                        return m.group(0)
-                    pii_hits += 1
-                    return "<IP_ADDRESS>"
-
-                content = _IPV4_RX.sub(_ip_repl, content)
+        # Pass 3 — apply results: drops, redactions, stats (parent only).
+        out: list[dict] = []
+        live = ctx.progress("secrets_scan", total=len(rows))
+        if len(rows) > len(survivors):
+            live.update(len(rows) - len(survivors))
+        for rec, (changed, type_counts, assign_hits, email_hits, ip_hits) in zip(
+            survivors, results
+        ):
+            live.update()
+            secret_hits = assign_hits
+            for name, n in type_counts:
+                secret_hits += n
+                ctx.bump(f"secrets.type.{name}", n)
+            if assign_hits:
+                ctx.bump("secrets.type.high_entropy_assignment", assign_hits)
+            pii_hits = email_hits + ip_hits
 
             if secret_hits > max_hits:
                 ctx.exclude(rec, "secret_dense", detail=f"{secret_hits} redactions")
                 ctx.bump("secrets.files_dropped_dense")
                 continue
 
-            if secret_hits or pii_hits:
-                rec["content"] = content
-                rec["content_sha256"] = sha256_text(content)
-                rec["size_bytes"] = len(content.encode("utf-8", errors="replace"))
-                rec["token_count"] = count_tokens(content, token_mode)
+            if changed is not None:
+                data = changed.encode("utf-8", errors="replace")
+                rec["content"] = changed
+                rec["content_sha256"] = sha256_bytes(data)
+                rec["size_bytes"] = len(data)
+                rec["token_count"] = count_tokens(changed, token_mode,
+                                                  size_bytes=len(data))
             rec["secrets_redacted"] = secret_hits
             rec["pii_redacted"] = pii_hits
             if secret_hits:

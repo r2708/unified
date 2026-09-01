@@ -50,6 +50,9 @@ def write_subset_outputs(ctx: ShardContext, rows: list[dict], part_name: str) ->
     source = ctx.shard["source_dataset"]
     compression = ctx.cfg.processing.parquet_compression
     row_group_size = int(ctx.cfg.processing.parquet_row_group_size)
+    row_group_max_bytes = (
+        int(ctx.cfg.path("processing.parquet_row_group_max_mb", 64)) * 1024 * 1024
+    )
 
     by_subset: dict[str, list[dict]] = {}
     for rec in rows:
@@ -71,6 +74,7 @@ def write_subset_outputs(ctx: ShardContext, rows: list[dict], part_name: str) ->
         records = write_rows_parquet(
             iter(out_rows), tmp, schema=schema,
             compression=compression, row_group_size=row_group_size,
+            row_group_max_bytes=row_group_max_bytes,
         )
         os.replace(tmp, local)
         outputs.append(

@@ -52,6 +52,7 @@ DEFAULTS: dict[str, Any] = {
         "mock_dir": None,         # defaults to <workspace>/mock_hub
         "upload_excluded_reports": True,
         "max_retries": 5,
+        "upload_workers": 4,     # parallel per-file uploads/verifications
     },
     "queue": {
         "max_local_shards": constants.DEFAULT_MAX_LOCAL_SHARDS,
@@ -81,8 +82,18 @@ DEFAULTS: dict[str, Any] = {
         # checkpoints only save repeated work.
         "checkpoint_after": ["normalize", "dedup_near", "secrets_scan"],
         "parquet_compression": "zstd",
-        "parquet_row_group_size": 2048,
+        # Row groups close at this many rows OR parquet_row_group_max_mb of
+        # uncompressed content, whichever first. Large groups = much faster
+        # downstream scans; the byte cap bounds writer memory. Layout-only:
+        # both are excluded from the config hash.
+        "parquet_row_group_size": 65536,
+        "parquet_row_group_max_mb": 64,
         "token_counter": "heuristic",  # heuristic | tiktoken
+        # Process pool for per-record CPU work (MinHash signatures, secrets
+        # battery, quality metrics). 1 = serial, N = N workers, 0 = auto
+        # (cpu_count - 2, capped at 8). Purely a performance knob: results
+        # are bit-identical to serial and it is excluded from the config hash.
+        "cpu_workers": 0,
     },
     "dedup": {
         "exact": {"enabled": True},
@@ -155,8 +166,17 @@ DEFAULTS: dict[str, Any] = {
 # Underscore-prefixed keys and the derived config_* keys are always excluded.
 _HASH_EXCLUDE_TOP = {"paths", "hf", "queue", "prototype", "config_hash", "config_file"}
 _HASH_EXCLUDE_SOURCE_KEYS = {"max_shards", "enabled"}
-# Nested keys that only change chunking / resume granularity, never records.
-_HASH_EXCLUDE_NESTED = {("processing", "batch_size"), ("processing", "checkpoint_after")}
+# Nested keys that only change chunking / resume granularity / parallelism /
+# output file layout, never record content or selection.
+_HASH_EXCLUDE_NESTED = {
+    ("processing", "batch_size"),
+    ("processing", "checkpoint_after"),
+    ("processing", "cpu_workers"),
+    ("processing", "parquet_row_group_size"),
+    ("processing", "parquet_row_group_max_mb"),
+}
+# Per-source nested keys that are purely operational (download parallelism).
+_HASH_EXCLUDE_SOURCE_NESTED = {("swh", "max_fetch_threads")}
 
 
 def load_dotenv_files(*candidates: str | Path) -> list[str]:
@@ -243,10 +263,18 @@ def compute_config_hash(cfg: dict) -> str:
         if key == "sources":
             sources = {}
             for name, scfg in (value or {}).items():
-                sources[name] = {
-                    k: v for k, v in (scfg or {}).items()
-                    if k not in _HASH_EXCLUDE_SOURCE_KEYS
-                }
+                filtered_source = {}
+                for k, v in (scfg or {}).items():
+                    if k in _HASH_EXCLUDE_SOURCE_KEYS:
+                        continue
+                    if isinstance(v, dict):
+                        excluded_sub = {
+                            sub for sec, sub in _HASH_EXCLUDE_SOURCE_NESTED if sec == k
+                        }
+                        if excluded_sub:
+                            v = {kk: vv for kk, vv in v.items() if kk not in excluded_sub}
+                    filtered_source[k] = v
+                sources[name] = filtered_source
             hashable[key] = sources
         else:
             hashable[key] = value

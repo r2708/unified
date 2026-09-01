@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 venv/
+.venv/
 workspace/
 .mock_hub/
 .pytest_cache/

@@ -1,9 +1,17 @@
 """Persistent, crash-safe pipeline state: the checkpoint/manifest database.
 
-SQLite in WAL mode with synchronous=FULL. A single connection guarded by a
+SQLite in WAL mode with synchronous=NORMAL. A single connection guarded by a
 process-wide lock serves every thread; every multi-statement mutation runs in
-an explicit BEGIN IMMEDIATE transaction, so a hard kill (power failure, OOM,
-SIGKILL) can never leave a half-written state.
+an explicit BEGIN IMMEDIATE transaction, so a hard kill (OOM, SIGKILL) can
+never leave a half-written or lost state. Power loss / OS crash can drop the
+most recent commits but never corrupts the DB (WAL guarantee) — and every
+consumer re-derives from re-checkable ground truth (Hub checksums, fsynced
+progress files, idempotent INSERT OR IGNORE indexes), so the worst case is
+redoing a little work. The one place a lost commit could silently matter —
+marking an uploaded batch done in the fsynced batch_progress.json while its
+dedup-index commits die with the page cache — is closed by the runner calling
+sync() (a WAL checkpoint, i.e. one real fsync per batch) before writing the
+progress file.
 
 Tables
 ------
@@ -119,7 +127,10 @@ class Manifest:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
+        # NORMAL in WAL mode: commits skip the per-transaction fsync (large
+        # I/O win, especially on network/cloud disks) while staying corruption
+        # -proof; durability barriers happen at batch boundaries via sync().
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=60000")
         with self._txn():
             for ddl in _DDL:
@@ -129,6 +140,14 @@ class Manifest:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def sync(self) -> None:
+        """Durability barrier: fsync the WAL so every commit made so far
+        survives power loss. Called once per uploaded batch / stage
+        checkpoint — the batched replacement for synchronous=FULL's
+        per-transaction fsync."""
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
     @contextmanager
     def _txn(self):
@@ -324,36 +343,22 @@ class Manifest:
         """Returns (is_new, canonical_record_id). When the hash was already
         seen, the new source is merged into the canonical provenance set
         (set semantics — idempotent on re-run)."""
-        with self._txn() as conn:
-            row = conn.execute(
-                "SELECT canonical_record_id, canonical_shard_id, sources"
-                " FROM exact_hashes WHERE content_sha256=?",
-                (content_sha256,),
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO exact_hashes VALUES (?,?,?,?)",
-                    (content_sha256, record_id, shard_id, json.dumps([source])),
-                )
-                return True, record_id
-            # A record re-encountering itself (same shard re-run after a
-            # crash) is not a duplicate.
-            if row["canonical_record_id"] == record_id and row["canonical_shard_id"] == shard_id:
-                return True, record_id
-            sources = json.loads(row["sources"])
-            if source not in sources:
-                sources.append(source)
-                conn.execute(
-                    "UPDATE exact_hashes SET sources=? WHERE content_sha256=?",
-                    (json.dumps(sorted(sources)), content_sha256),
-                )
-            return False, row["canonical_record_id"]
+        return self.exact_seen_or_add_many(
+            [(content_sha256, record_id, shard_id, source)]
+        )[content_sha256]
 
     def exact_seen_or_add_many(
         self, items: list[tuple[str, str, str, str]]
     ) -> dict[str, tuple[bool, str]]:
-        """Batch variant of exact_seen_or_add — one transaction (one fsync)
-        per record batch instead of per record.
+        """Batch exact-dedup lookup/insert: one transaction (one fsync) per
+        record batch, and one bulk pre-fetch per ~500 hashes instead of one
+        SELECT round trip per record.
+
+        Semantics match processing the items one at a time, in order: the
+        first sighting of a hash (in the DB or earlier in this same batch)
+        is canonical, a record re-encountering itself (same shard re-run
+        after a crash) is not a duplicate, and every duplicate's source is
+        merged into the canonical row's provenance set.
 
         items: (content_sha256, record_id, shard_id, source)
         returns: {content_sha256: (is_new, canonical_record_id)}
@@ -362,47 +367,87 @@ class Manifest:
         if not items:
             return results
         with self._txn() as conn:
+            # Bulk pre-fetch of every hash in the batch (chunked IN-queries).
+            # Probes and inserts run in SORTED key order: on an index bigger
+            # than the page cache, ascending B-tree sweeps beat random point
+            # probes; order has no effect on the results.
+            existing: dict[str, tuple[str, str, list[str]]] = {}
+            hashes = sorted(dict.fromkeys(item[0] for item in items))
+            for i in range(0, len(hashes), 500):
+                chunk = hashes[i : i + 500]
+                marks = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    "SELECT content_sha256, canonical_record_id,"
+                    " canonical_shard_id, sources FROM exact_hashes"
+                    f" WHERE content_sha256 IN ({marks})",
+                    chunk,
+                ):
+                    existing[row[0]] = (row[1], row[2], json.loads(row[3]))
+
+            inserts: list[tuple[str, str, str, str]] = []
+            merged: set[str] = set()  # hashes whose provenance gained a source
             for content_sha256, record_id, shard_id, source in items:
-                row = conn.execute(
-                    "SELECT canonical_record_id, canonical_shard_id, sources"
-                    " FROM exact_hashes WHERE content_sha256=?",
-                    (content_sha256,),
-                ).fetchone()
-                if row is None:
-                    conn.execute(
-                        "INSERT INTO exact_hashes VALUES (?,?,?,?)",
-                        (content_sha256, record_id, shard_id, json.dumps([source])),
+                entry = existing.get(content_sha256)
+                if entry is None:
+                    # First sighting anywhere: this record becomes canonical
+                    # (also visible to later duplicates in this same batch).
+                    existing[content_sha256] = (record_id, shard_id, [source])
+                    inserts.append(
+                        (content_sha256, record_id, shard_id, json.dumps([source]))
                     )
                     results[content_sha256] = (True, record_id)
                     continue
-                if (
-                    row["canonical_record_id"] == record_id
-                    and row["canonical_shard_id"] == shard_id
-                ):
+                canonical_id, canonical_shard, sources = entry
+                if canonical_id == record_id and canonical_shard == shard_id:
+                    # A record re-encountering itself (same shard re-run
+                    # after a crash) is not a duplicate.
                     results[content_sha256] = (True, record_id)
                     continue
-                sources = json.loads(row["sources"])
                 if source not in sources:
                     sources.append(source)
-                    conn.execute(
-                        "UPDATE exact_hashes SET sources=? WHERE content_sha256=?",
-                        (json.dumps(sorted(sources)), content_sha256),
-                    )
-                results[content_sha256] = (False, row["canonical_record_id"])
+                    merged.add(content_sha256)
+                results[content_sha256] = (False, canonical_id)
+
+            if inserts:
+                inserts.sort()
+                conn.executemany(
+                    "INSERT INTO exact_hashes VALUES (?,?,?,?)", inserts
+                )
+            if merged:
+                # After the inserts, so a source merged onto a row first seen
+                # in this very batch lands too (same as sequential order).
+                conn.executemany(
+                    "UPDATE exact_hashes SET sources=? WHERE content_sha256=?",
+                    [
+                        (json.dumps(sorted(existing[h][2])), h)
+                        for h in sorted(merged)
+                    ],
+                )
         return results
 
-    def iter_multi_source_hashes(self):
+    def iter_multi_source_hashes(self, batch: int = 5000):
         """Yield (content_sha256, canonical_record_id, sources) for content
         seen in more than one source dataset — the durable cross-source
-        provenance merge exported by `finalize`."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT content_sha256, canonical_record_id, sources FROM exact_hashes"
-            ).fetchall()
-        for row in rows:
-            sources = json.loads(row["sources"])
-            if len(sources) > 1:
-                yield row["content_sha256"], row["canonical_record_id"], sources
+        provenance merge exported by `finalize`.
+
+        Streams with keyset pagination: exact_hashes can reach hundreds of
+        millions of rows, so the table is never fetchall()'d into RAM."""
+        last = ""
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT content_sha256, canonical_record_id, sources"
+                    " FROM exact_hashes WHERE content_sha256 > ?"
+                    " ORDER BY content_sha256 LIMIT ?",
+                    (last, int(batch)),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                sources = json.loads(row["sources"])
+                if len(sources) > 1:
+                    yield row["content_sha256"], row["canonical_record_id"], sources
+            last = rows[-1]["content_sha256"]
 
     def exact_sources_for(self, content_sha256: str) -> list[str]:
         with self._lock:
@@ -413,14 +458,28 @@ class Manifest:
         return json.loads(row["sources"]) if row else []
 
     # --------------------------------------------------- near deduplication
-    def band_candidates(self, band: int, band_hash: bytes, exclude_shard: str) -> list[str]:
+    def band_candidates_many(
+        self, band_to_hashes: dict[int, Sequence[bytes]], exclude_shard: str
+    ) -> dict[tuple[int, bytes], list[str]]:
+        """Cross-shard LSH candidate lookup for a whole chunk of records at
+        once: one IN-query per band per ~500 hashes instead of one query per
+        record per band. Only (band, hash) pairs with hits appear in the
+        result."""
+        out: dict[tuple[int, bytes], list[str]] = {}
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT record_id FROM minhash_bands"
-                " WHERE band=? AND band_hash=? AND shard_id != ?",
-                (band, band_hash, exclude_shard),
-            ).fetchall()
-        return [r["record_id"] for r in rows]
+            for band, hashes in band_to_hashes.items():
+                uniq = list(dict.fromkeys(hashes))
+                for i in range(0, len(uniq), 500):
+                    chunk = uniq[i : i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    rows = self._conn.execute(
+                        "SELECT band_hash, record_id FROM minhash_bands"
+                        f" WHERE band=? AND band_hash IN ({marks}) AND shard_id != ?",
+                        (band, *chunk, exclude_shard),
+                    ).fetchall()
+                    for r in rows:
+                        out.setdefault((band, r["band_hash"]), []).append(r["record_id"])
+        return out
 
     def get_sigs(self, record_ids: Sequence[str]) -> dict[str, bytes]:
         if not record_ids:
@@ -539,29 +598,70 @@ class Manifest:
         self, repo_key: str, complexity: float | None = None, category: str | None = None
     ) -> None:
         """Overwrite derived repo fields (idempotent — safe to re-run)."""
+        self.update_repo_computed_many([(repo_key, complexity, category)])
+
+    def update_repo_computed_many(
+        self, rows: list[tuple[str, float | None, str | None]]
+    ) -> None:
+        """Batch variant of update_repo_computed: one transaction (one fsync)
+        for a whole batch's repos instead of one per repo.
+
+        rows: (repo_key, complexity or None, category or None)
+        """
+        if not rows:
+            return
+        now = now_iso()
         with self._txn() as conn:
-            conn.execute(
+            conn.executemany(
                 "UPDATE repos SET complexity=COALESCE(?, complexity),"
                 " category=COALESCE(?, category), updated_at=? WHERE repo_key=?",
-                (complexity, category, now_iso(), repo_key),
+                [(c, cat, now, key) for key, c, cat in rows],
             )
+
+    @staticmethod
+    def _decode_repo_row(row) -> dict:
+        repo = dict(row)
+        for key in ("languages", "layers", "technologies", "licenses"):
+            repo[key] = json.loads(repo[key])
+        return repo
 
     def get_repo(self, repo_key: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM repos WHERE repo_key=?", (repo_key,)
             ).fetchone()
-        if row is None:
-            return None
-        repo = dict(row)
-        for key in ("languages", "layers", "technologies", "licenses"):
-            repo[key] = json.loads(repo[key])
-        return repo
+        return self._decode_repo_row(row) if row else None
+
+    def get_repos(self, repo_keys: Sequence[str]) -> dict[str, dict]:
+        """Batch variant of get_repo: chunked IN-queries instead of one query
+        per repo. Missing keys are simply absent from the result."""
+        out: dict[str, dict] = {}
+        if not repo_keys:
+            return out
+        with self._lock:
+            for i in range(0, len(repo_keys), 500):
+                chunk = list(repo_keys[i : i + 500])
+                marks = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    f"SELECT * FROM repos WHERE repo_key IN ({marks})", chunk
+                ).fetchall()
+                for row in rows:
+                    out[row["repo_key"]] = self._decode_repo_row(row)
+        return out
 
     def iter_repos(self, batch: int = 1000):
-        with self._lock:
-            rows = self._conn.execute("SELECT repo_key FROM repos ORDER BY repo_key").fetchall()
-        for row in rows:
-            repo = self.get_repo(row["repo_key"])
-            if repo:
-                yield repo
+        """Stream every repo row (one ordered scan, decoded in batches —
+        not one query per repo)."""
+        last_key = ""
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM repos WHERE repo_key > ?"
+                    " ORDER BY repo_key LIMIT ?",
+                    (last_key, int(batch)),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield self._decode_repo_row(row)
+            last_key = rows[-1]["repo_key"]

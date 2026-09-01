@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Iterator
 
-from ucc.hashing import make_record_id, sha256_text
+from ucc.hashing import make_record_id, sha256_bytes
 from ucc.processing.base import ShardContext, Stage
 from ucc.tokens import count_tokens
 
@@ -34,9 +34,11 @@ class RecordNormalizer:
         if rec is None:
             return None
         content = rec["content"]
-        rec["content_sha256"] = sha256_text(content)
-        rec["size_bytes"] = len(content.encode("utf-8", errors="replace"))
-        rec["token_count"] = count_tokens(content, self.token_mode)
+        # One UTF-8 encode feeds hash, size and (heuristic) token count.
+        data = content.encode("utf-8", errors="replace")
+        rec["content_sha256"] = sha256_bytes(data)
+        rec["size_bytes"] = len(data)
+        rec["token_count"] = count_tokens(content, self.token_mode, size_bytes=len(data))
         rec["id"] = make_record_id(
             rec.get("repo_name"), rec.get("path"), rec["content_sha256"]
         )

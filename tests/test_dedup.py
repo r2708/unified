@@ -49,3 +49,30 @@ def test_near_dedup_annotates_and_exempts_history(make_ctx):
     assert flagged[0]["near_dup_cluster"] == canonical_id
     # historical record types are never near-deduped
     assert all(not r["is_near_duplicate"] for r in out if r["record_type"] == "commit")
+
+
+def test_near_dedup_across_shards(make_ctx):
+    """A later shard must find near-duplicates indexed by an earlier shard
+    through the persistent LSH index (batched candidate lookup + stored
+    signatures)."""
+    pytest.importorskip("datasketch")
+    pytest.importorskip("xxhash")
+    from ucc.processing.dedup_near import NearDedupStage
+
+    base = "\n".join(
+        f"def handler_{i}(request):\n    payload = request.json\n"
+        f"    return process(payload, retries={i})" for i in range(40)
+    )
+    ctx1 = make_ctx()
+    original = make_rec(base, repo_name="org/one", path="app.py")
+    out1 = NearDedupStage().run([original], ctx1)
+    assert out1 == [original] and not original["is_near_duplicate"]
+
+    ctx2 = make_ctx(shard_id="other-000002", source="othersource", seq=2)
+    fork = make_rec(base.replace("retries=7", "retries=9") + "\n# tweak\n",
+                    repo_name="org/fork", path="app.py",
+                    source="othersource", shard="other-000002")
+    out2 = NearDedupStage().run([fork], ctx2)
+    assert len(out2) == 1
+    assert out2[0]["is_near_duplicate"]
+    assert out2[0]["near_dup_cluster"] == original["id"]

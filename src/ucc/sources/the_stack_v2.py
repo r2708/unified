@@ -188,7 +188,7 @@ class TheStackV2Adapter(SourceAdapter):
         import boto3
         from botocore.config import Config
 
-        threads = int(self.source_cfg.path("swh.max_fetch_threads", 16))
+        threads = int(self.source_cfg.path("swh.max_fetch_threads", 32))
         return boto3.client(
             "s3",
             config=Config(
@@ -216,7 +216,7 @@ class TheStackV2Adapter(SourceAdapter):
     def download(self, spec_ref: dict, dest_dir: Path, stop_check=None) -> None:
         bucket = self.source_cfg.path("swh.bucket", "softwareheritage")
         prefix = self.source_cfg.path("swh.prefix", "content")
-        threads = int(self.source_cfg.path("swh.max_fetch_threads", 16))
+        threads = int(self.source_cfg.path("swh.max_fetch_threads", 32))
         max_missing = float(self.source_cfg.path("swh.max_missing_ratio", 0.05))
 
         fs = self._hf_fs()
@@ -246,25 +246,31 @@ class TheStackV2Adapter(SourceAdapter):
         )
         fetched = 0
         missing = 0
+        chunk = 2000
+        chunks = [meta_rows[o : o + chunk] for o in range(0, len(meta_rows), chunk)]
+        # One pool for the whole shard (no per-chunk thread churn); the next
+        # chunk's fetches run while the current one is decoded and written,
+        # so the S3 workers never sit idle behind the parquet writer.
+        pool = ThreadPoolExecutor(max_workers=threads)
+
+        def _submit(part: list[dict]) -> list:
+            return [
+                pool.submit(self._fetch_blob, client, bucket, prefix, row["blob_id"])
+                if row.get("blob_id")
+                else None
+                for row in part
+            ]
+
         try:
             writer = pq.ParquetWriter(tmp_path, RAW_CONTENT_SCHEMA, compression="zstd")
             try:
-                chunk = 2000
-                for offset in range(0, len(meta_rows), chunk):
+                pending = _submit(chunks[0]) if chunks else []
+                for idx, part in enumerate(chunks):
                     if stop_check is not None and stop_check():
                         raise DownloadError("download interrupted by pipeline shutdown")
-                    part = meta_rows[offset : offset + chunk]
-                    with ThreadPoolExecutor(max_workers=threads) as pool:
-                        blobs = list(
-                            pool.map(
-                                lambda row: self._fetch_blob(
-                                    client, bucket, prefix, row.get("blob_id")
-                                )
-                                if row.get("blob_id")
-                                else None,
-                                part,
-                            )
-                        )
+                    futures = pending
+                    pending = _submit(chunks[idx + 1]) if idx + 1 < len(chunks) else []
+                    blobs = [f.result() if f is not None else None for f in futures]
                     out_rows = []
                     for row, blob in zip(part, blobs):
                         if blob is None:
@@ -311,6 +317,8 @@ class TheStackV2Adapter(SourceAdapter):
             raise DownloadError(
                 f"SWH content fetch failed: {exc.__class__.__name__}: {exc}"
             ) from exc
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
         total = fetched + missing
         if total == 0 or (missing / max(total, 1)) > max_missing:

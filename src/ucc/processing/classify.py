@@ -169,6 +169,16 @@ def detect_technologies(path: str | None, content_head: str) -> list[str]:
     return sorted(set(found))
 
 
+def layer_and_technologies(
+    item: tuple[str | None, str | None, str],
+) -> tuple[str, list[str]]:
+    """Pure per-record classification (process-pool worker): item is
+    (path, language, content head). The ~30-regex tech/layer pass dominates
+    repo_reconstruct, so it is farmed out via processing.cpu_workers."""
+    path, language, head = item
+    return file_layer(path, language, head), detect_technologies(path, head)
+
+
 def repo_category(agg: dict) -> str:
     """Categorize a repository from its (cross-shard) aggregates."""
     layers: dict[str, int] = agg.get("layers") or {}
@@ -216,26 +226,52 @@ class ClassifyStage(Stage):
 
     def run(self, rows: list[dict], ctx: ShardContext) -> list[dict]:
         # Per-record layer + technologies (heads only — cheap and robust).
+        # repo_reconstruct already classified each record and cached the
+        # results on it; reuse them unless the secrets stage redacted the
+        # content in between (the caches are head-derived) or a checkpoint
+        # resume dropped the underscore keys from the rows.
         repo_seen: dict[str, dict] = {}
         live = ctx.progress("classify", total=len(rows))
         for rec in rows:
             live.update()
             head = (rec.get("content") or "")[:4000]
-            rec["language"] = infer_language(rec.get("path"), rec.get("language"))
-            rec["layer"] = file_layer(rec.get("path"), rec.get("language"), head)
-            rec["technologies"] = detect_technologies(rec.get("path"), head)
+            content_unchanged = (
+                not rec.get("secrets_redacted") and not rec.get("pii_redacted")
+            )
+            cached_language = rec.pop("_ucc_language", None)
+            cached_layer = rec.pop("_ucc_layer", None)
+            cached_techs = rec.pop("_ucc_technologies", None)
+
+            language = cached_language or infer_language(
+                rec.get("path"), rec.get("language")
+            )
+            rec["language"] = language
+            rec["layer"] = (
+                cached_layer
+                if cached_layer is not None and content_unchanged
+                else file_layer(rec.get("path"), language, head)
+            )
+            rec["technologies"] = (
+                cached_techs
+                if cached_techs is not None and content_unchanged
+                else detect_technologies(rec.get("path"), head)
+            )
             repo = rec.get("repo_name")
             if repo:
                 info = repo_seen.setdefault(repo, {"cli": False})
-                if looks_like_cli(head):
+                if not info["cli"] and looks_like_cli(head):
                     info["cli"] = True
         live.close()
 
         # Repository category from cross-shard aggregates in the manifest
         # (merged by repo_reconstruct, including this shard's contribution).
+        # One batched read + one batched write instead of two statements (and
+        # one fsync) per distinct repo.
+        aggs = ctx.manifest.get_repos(sorted(repo_seen))
         categories: dict[str, str] = {}
+        updates: list[tuple[str, float | None, str | None]] = []
         for repo, info in repo_seen.items():
-            agg = ctx.manifest.get_repo(repo) or {}
+            agg = aggs.get(repo) or {}
             agg["is_cli"] = info["cli"]
             layers_hist = agg.get("layers") or {}
             agg["is_library"] = (
@@ -245,7 +281,8 @@ class ClassifyStage(Stage):
             )
             category = repo_category(agg)
             categories[repo] = category
-            ctx.manifest.update_repo_computed(repo, category=category)
+            updates.append((repo, None, category))
+        ctx.manifest.update_repo_computed_many(updates)
 
         for rec in rows:
             repo = rec.get("repo_name")
