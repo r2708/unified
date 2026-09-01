@@ -431,22 +431,27 @@ class Manifest:
         provenance merge exported by `finalize`.
 
         Streams with keyset pagination: exact_hashes can reach hundreds of
-        millions of rows, so the table is never fetchall()'d into RAM."""
+        millions of rows, so the table is never fetchall()'d into RAM. The
+        multi-source filter runs inside SQLite so single-source rows (the
+        vast majority) are never shipped to Python or json.loads'd."""
         last = ""
         while True:
             with self._lock:
                 rows = self._conn.execute(
                     "SELECT content_sha256, canonical_record_id, sources"
                     " FROM exact_hashes WHERE content_sha256 > ?"
+                    " AND json_array_length(sources) > 1"
                     " ORDER BY content_sha256 LIMIT ?",
                     (last, int(batch)),
                 ).fetchall()
             if not rows:
                 return
             for row in rows:
-                sources = json.loads(row["sources"])
-                if len(sources) > 1:
-                    yield row["content_sha256"], row["canonical_record_id"], sources
+                yield (
+                    row["content_sha256"],
+                    row["canonical_record_id"],
+                    json.loads(row["sources"]),
+                )
             last = rows[-1]["content_sha256"]
 
     def exact_sources_for(self, content_sha256: str) -> list[str]:
@@ -512,21 +517,21 @@ class Manifest:
             )
 
     # ------------------------------------------------------ repo aggregates
-    def _merge_repo_in_txn(self, conn, repo_key: str, delta: dict) -> None:
+    @staticmethod
+    def _merge_repo_delta(
+        repo_key: str, delta: dict, current: dict | None, now: str
+    ) -> tuple:
         """Merge one repo delta (counts summed, histograms merged, sets
-        unioned, booleans OR-ed). Must be called inside an open transaction."""
-        row = conn.execute("SELECT * FROM repos WHERE repo_key=?", (repo_key,)).fetchone()
-        if row is None:
+        unioned, booleans OR-ed) into `current` — the pre-fetched, decoded
+        repo row, or None if the repo is new. Returns the parameter tuple
+        for the repos upsert in apply_repo_deltas."""
+        if current is None:
             current = {
                 "repo_url": None, "n_files": 0, "n_tokens": 0, "n_commits": 0,
                 "n_issues": 0, "n_deps": 0, "languages": {}, "layers": {},
                 "technologies": [], "licenses": [], "has_tests": 0, "has_ci": 0,
                 "has_infrastructure": 0, "category": None, "complexity": None,
             }
-        else:
-            current = dict(row)
-            for key in ("languages", "layers", "technologies", "licenses"):
-                current[key] = json.loads(current[key])
 
         for key in ("n_files", "n_tokens", "n_commits", "n_issues", "n_deps"):
             current[key] += int(delta.get(key, 0))
@@ -544,34 +549,17 @@ class Manifest:
         if delta.get("complexity") is not None:
             current["complexity"] = float(delta["complexity"])
 
-        conn.execute(
-            """INSERT INTO repos (repo_key, repo_url, n_files, n_tokens, n_commits,
-                   n_issues, n_deps, languages, layers, technologies, licenses,
-                   has_tests, has_ci, has_infrastructure, category, complexity,
-                   updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(repo_key) DO UPDATE SET
-                   repo_url=excluded.repo_url, n_files=excluded.n_files,
-                   n_tokens=excluded.n_tokens, n_commits=excluded.n_commits,
-                   n_issues=excluded.n_issues, n_deps=excluded.n_deps,
-                   languages=excluded.languages, layers=excluded.layers,
-                   technologies=excluded.technologies, licenses=excluded.licenses,
-                   has_tests=excluded.has_tests, has_ci=excluded.has_ci,
-                   has_infrastructure=excluded.has_infrastructure,
-                   category=excluded.category, complexity=excluded.complexity,
-                   updated_at=excluded.updated_at""",
-            (
-                repo_key, current["repo_url"], current["n_files"],
-                current["n_tokens"], current["n_commits"], current["n_issues"],
-                current["n_deps"],
-                json.dumps(current["languages"], sort_keys=True),
-                json.dumps(current["layers"], sort_keys=True),
-                json.dumps(current["technologies"]),
-                json.dumps(current["licenses"]),
-                current["has_tests"], current["has_ci"],
-                current["has_infrastructure"], current["category"],
-                current["complexity"], now_iso(),
-            ),
+        return (
+            repo_key, current["repo_url"], current["n_files"],
+            current["n_tokens"], current["n_commits"], current["n_issues"],
+            current["n_deps"],
+            json.dumps(current["languages"], sort_keys=True),
+            json.dumps(current["layers"], sort_keys=True),
+            json.dumps(current["technologies"]),
+            json.dumps(current["licenses"]),
+            current["has_tests"], current["has_ci"],
+            current["has_infrastructure"], current["category"],
+            current["complexity"], now,
         )
 
     def apply_repo_deltas(self, shard_id: str, deltas: dict[str, dict]) -> bool:
@@ -583,15 +571,34 @@ class Manifest:
         Returns False if this shard's deltas were already applied.
         """
         flag_key = f"repos_merged:{shard_id}"
+        now = now_iso()
         with self._txn() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (flag_key,)).fetchone()
             if row is not None:
                 return False
-            for repo_key, delta in deltas.items():
-                self._merge_repo_in_txn(conn, repo_key, delta)
-            conn.execute(
-                "INSERT INTO kv(key, value) VALUES(?, ?)", (flag_key, now_iso())
+            existing = self._fetch_repos_on_conn(conn, list(deltas))
+            conn.executemany(
+                """INSERT INTO repos (repo_key, repo_url, n_files, n_tokens, n_commits,
+                       n_issues, n_deps, languages, layers, technologies, licenses,
+                       has_tests, has_ci, has_infrastructure, category, complexity,
+                       updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(repo_key) DO UPDATE SET
+                       repo_url=excluded.repo_url, n_files=excluded.n_files,
+                       n_tokens=excluded.n_tokens, n_commits=excluded.n_commits,
+                       n_issues=excluded.n_issues, n_deps=excluded.n_deps,
+                       languages=excluded.languages, layers=excluded.layers,
+                       technologies=excluded.technologies, licenses=excluded.licenses,
+                       has_tests=excluded.has_tests, has_ci=excluded.has_ci,
+                       has_infrastructure=excluded.has_infrastructure,
+                       category=excluded.category, complexity=excluded.complexity,
+                       updated_at=excluded.updated_at""",
+                [
+                    self._merge_repo_delta(repo_key, delta, existing.get(repo_key), now)
+                    for repo_key, delta in deltas.items()
+                ],
             )
+            conn.execute("INSERT INTO kv(key, value) VALUES(?, ?)", (flag_key, now))
         return True
 
     def update_repo_computed(
@@ -632,22 +639,28 @@ class Manifest:
             ).fetchone()
         return self._decode_repo_row(row) if row else None
 
+    @classmethod
+    def _fetch_repos_on_conn(cls, conn, repo_keys: Sequence[str]) -> dict[str, dict]:
+        """Fetch repo rows by key with chunked IN-queries on a given
+        connection. Missing keys are simply absent from the result."""
+        out: dict[str, dict] = {}
+        for i in range(0, len(repo_keys), 500):
+            chunk = list(repo_keys[i : i + 500])
+            marks = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM repos WHERE repo_key IN ({marks})", chunk
+            ).fetchall()
+            for row in rows:
+                out[row["repo_key"]] = cls._decode_repo_row(row)
+        return out
+
     def get_repos(self, repo_keys: Sequence[str]) -> dict[str, dict]:
         """Batch variant of get_repo: chunked IN-queries instead of one query
         per repo. Missing keys are simply absent from the result."""
-        out: dict[str, dict] = {}
         if not repo_keys:
-            return out
+            return {}
         with self._lock:
-            for i in range(0, len(repo_keys), 500):
-                chunk = list(repo_keys[i : i + 500])
-                marks = ",".join("?" * len(chunk))
-                rows = self._conn.execute(
-                    f"SELECT * FROM repos WHERE repo_key IN ({marks})", chunk
-                ).fetchall()
-                for row in rows:
-                    out[row["repo_key"]] = self._decode_repo_row(row)
-        return out
+            return self._fetch_repos_on_conn(self._conn, repo_keys)
 
     def iter_repos(self, batch: int = 1000):
         """Stream every repo row (one ordered scan, decoded in batches —
