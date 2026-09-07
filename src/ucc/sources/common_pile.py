@@ -80,6 +80,7 @@ class CommonPileStackV2Adapter(SourceAdapter):
             dest_dir,
             self.token,
             stop_check,
+            retries=int(self.cfg.hf.max_retries),
         )
 
     def iter_raw_batches(self, spec_ref: dict, raw_dir: Path, batch_size: int,

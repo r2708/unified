@@ -9,3 +9,4 @@ workspace/
 .DS_Store
 dist/
 build/
+.env

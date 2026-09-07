@@ -1,5 +1,7 @@
 # Core pipeline dependencies (see pyproject.toml for the canonical list)
 huggingface_hub>=0.24.0
+hf_xet>=1.0        # fast Xet download path (huggingface_hub >= 1.0)
+hf_transfer>=0.1.6 # fast download path for huggingface_hub < 1.0
 pyarrow>=15.0.0
 numpy>=1.24
 datasketch>=2.0,<3
