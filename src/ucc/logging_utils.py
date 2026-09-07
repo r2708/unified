@@ -52,6 +52,7 @@ def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) 
 
     console = logging.StreamHandler(sys.stderr)
     console.setFormatter(fmt)
+    console._ucc_console = True  # type: ignore[attr-defined]
     root.addHandler(console)
 
     if log_dir is not None:
@@ -73,6 +74,14 @@ def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) 
 
     root._ucc_configured = True  # type: ignore[attr-defined]
     return root
+
+
+def set_console_log_level(level: int) -> None:
+    """Raise/restore the terminal handler's level (file logging unaffected).
+    Used while the live status table owns the terminal."""
+    for handler in logging.getLogger("ucc").handlers:
+        if getattr(handler, "_ucc_console", False):
+            handler.setLevel(level)
 
 
 def get_logger(name: str) -> logging.Logger:

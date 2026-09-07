@@ -43,6 +43,8 @@ queue:
   retry_backoff_max_s: 3600
   min_free_disk_gb: 20          # downloads pause below this free space
   status_interval_s: 10         # OVERALL % line cadence (pipeline-wide)
+  live_table: true              # rich live status table on a TTY (fineweb-style);
+                                # false = classic scrolling log lines only
   progress_log_interval_s: 5    # per-task live % cadence (stage/download/
                                 # upload lines); lower = chattier logs
 

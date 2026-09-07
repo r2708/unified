@@ -13,6 +13,8 @@ PyYAML>=6.0
 orjson>=3.9
 tqdm>=4.66
 zstandard>=0.22
+rich>=13.7.0       # live terminal status table (falls back to log lines)
+psutil>=5.9.0      # memory stats for the live table
 
 # Optional: exact GPT-style token counts instead of the byte heuristic
 # tiktoken>=0.7

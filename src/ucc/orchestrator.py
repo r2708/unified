@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import threading
 import time
 import traceback
@@ -24,7 +25,8 @@ from ucc.crash import maybe_crash
 from ucc.hashing import combined_raw_checksum, sha256_file
 from ucc.hf_remote import build_hub
 from ucc.io_utils import atomic_write_json, ensure_dir, free_disk_gb, safe_rmtree
-from ucc.logging_utils import get_logger, setup_logging
+from ucc.live_table import LiveStatusTable
+from ucc.logging_utils import get_logger, set_console_log_level, setup_logging
 from ucc.manifest import Manifest
 from ucc.processing.base import ShardContext
 from ucc.processing.runner import RawValidationError, run_shard_pipeline
@@ -65,6 +67,9 @@ class Orchestrator:
         self.hub = build_hub(cfg)
         self.adapters = build_adapters(cfg)
         self.gauge = CapacityGauge(int(cfg.queue.max_local_shards))
+        self.live = LiveStatusTable(
+            self.paths.workspace, enabled=bool(cfg.path("queue.live_table", True))
+        )
         self.stop_event = threading.Event()
         self.exit_code = 0
         self._threads: list[threading.Thread] = []
@@ -432,14 +437,45 @@ class Orchestrator:
             snap["retryable"], snap["given_up"],
         )
 
+    def _live_snapshot(self, snap: dict) -> dict:
+        """Extend a progress snapshot with the fields the live table renders."""
+        tot = self.manifest.progress_totals()
+        working = self.manifest.shards_in_states(
+            [ShardState.DOWNLOADING, ShardState.PROCESSING, ShardState.UPLOADING]
+        )
+        names = ", ".join(f"{s['shard_id']} ({s['state']})" for s in working[:4])
+        if len(working) > 4:
+            names += f" +{len(working) - 4} more"
+        done = snap["counts"].get(ShardState.COMPLETED.value, 0) + snap[
+            "counts"
+        ].get(ShardState.SKIPPED.value, 0)
+        return {
+            **snap,
+            "active_shards": names,
+            "done": done,
+            "total": tot["total_shards"],
+            "records_out": tot["records_out"],
+            "tokens": tot["tokens"],
+            "slots_used": self.gauge.occupied,
+            "slots_max": self.gauge.max_slots,
+        }
+
     def _monitor_loop(self) -> None:
         interval = float(self.cfg.queue.status_interval_s)
-        while not self.stop_event.wait(interval):
+        # The live table refreshes faster than the OVERALL log cadence.
+        tick = min(2.0, interval) if self.live.enabled else interval
+        last_log = 0.0
+        while not self.stop_event.wait(tick):
             try:
                 snap = self._progress_snapshot()
+                self.live.update(self._live_snapshot(snap))
             except Exception:  # noqa: BLE001 - progress lines must never stop
                 log.error("monitor error (continuing):\n%s", traceback.format_exc())
                 continue
+            now = time.monotonic()
+            if now - last_log < interval:
+                continue
+            last_log = now
             self._log_overall_progress(snap)
             if snap["active"] == 0:
                 log.info("all shards reached a terminal state — shutting down")
@@ -502,6 +538,11 @@ class Orchestrator:
             ))
         workers.append(threading.Thread(target=self._janitor_loop, name="janitor", daemon=True))
         workers.append(threading.Thread(target=self._monitor_loop, name="monitor", daemon=True))
+        if self.live.enabled:
+            # The table owns the terminal: INFO detail keeps flowing to the
+            # log file, only warnings/errors break through to the console.
+            set_console_log_level(logging.WARNING)
+            self.live.start()
         for w in workers:
             w.start()
         self._threads = workers
@@ -513,6 +554,9 @@ class Orchestrator:
             self.stop_event.set()
             for w in workers:
                 w.join(timeout=60)
+            if self.live.enabled:
+                self.live.stop()
+                set_console_log_level(logging.INFO)
 
         snap = self._progress_snapshot()
         self._log_overall_progress(snap)
